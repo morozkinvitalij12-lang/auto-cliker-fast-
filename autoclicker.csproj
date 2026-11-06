@@ -9,7 +9,7 @@
     <AssemblyName>autoclicker</AssemblyName>
     <RootNamespace>AutoClicker</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Product>Автокликер</Product>
     <Description>Оконный и консольный автокликер для Windows на Win32 SendInput</Description>
 

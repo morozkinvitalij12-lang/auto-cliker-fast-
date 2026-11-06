@@ -31,6 +31,14 @@ internal sealed class MainForm : Form
     private Settings _current;
     private long _lastClicks;
     private bool _ownClickSeen;
+    private bool _hotkeysRegistered = true;
+    private bool? _deliveryBlocked;
+    private uint _foregroundPid;
+    private bool _foregroundElevated;
+    private readonly bool _selfElevated = Native.IsUserAnAdmin();
+
+    private const string DefaultHints =
+        "Ctrl+Alt+F3 — старт/стоп    Ctrl+Alt+F8 — координаты    Ctrl+Alt+F10 — выход";
 
     public MainForm(Settings defaults)
     {
@@ -140,7 +148,7 @@ internal sealed class MainForm : Form
 
         _hints = new Label
         {
-            Text = "Ctrl+Alt+F3 — старт/стоп    Ctrl+Alt+F8 — координаты    Ctrl+Alt+F10 — выход",
+            Text = DefaultHints,
             Location = new Point(14, 300),
             Size = new Size(381, 20),
             AutoSize = false,
@@ -173,7 +181,7 @@ internal sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
 
-        if (!Native.IsUserAnAdmin())
+        if (!_selfElevated)
         {
             _note.Text = "Кликер не от администратора: над окнами с правами выше (игра из-под admin) "
                 + "ни Ctrl+Alt+F3, ни клики не работают.";
@@ -193,6 +201,7 @@ internal sealed class MainForm : Form
             }
         }
 
+        _hotkeysRegistered = failures.Count == 0;
         if (failures.Count > 0)
         {
             // Строка подсказок внизу краснеет: видно, что F3 мёртв не из-за поломки кликера.
@@ -272,6 +281,9 @@ internal sealed class MainForm : Form
         else
         {
             Stop();
+            // После автосворачивания окно обычно не видно: без всплывашки остановку
+            // выдаётся заметить только по потухшему значку в трее.
+            ShowBalloon("Выключен.");
         }
 
         RefreshStatus();
@@ -294,6 +306,10 @@ internal sealed class MainForm : Form
 
     private void Start()
     {
+        // Убираем окно с дороги до первого клика: иначе первый же синтетический клик
+        // приходится в собственные контролы. Возврат — из трея двойным кликом или из панели.
+        WindowState = FormWindowState.Minimized;
+
         _current = BuildSettings();
         _lastClicks = 0;
         _cts = new CancellationTokenSource();
@@ -323,6 +339,8 @@ internal sealed class MainForm : Form
         {
             _note.Text = "Кликер бьёт туда, где курсор: держи его вне этого окна.";
         }
+
+        ShowBalloon("Включён и свёрнут. Ctrl+Alt+F3 — стоп, двойной клик по значку — окно.");
     }
 
     private void ShowBalloon(string message)
@@ -428,6 +446,46 @@ internal sealed class MainForm : Form
         _tray.Text = $"Автокликер: {(running ? "включён" : "выключен")} · кликов {clicks}";
 
         _status.Text = $"интервал {_current.IntervalMs} мс · {where} · {limit} · кликов за запуск: {clicks}";
+
+        UpdateTrustWarning();
+    }
+
+    /// Клики через SendInput не доходят до активного окна с правами выше (UIPI) — об этом окно
+    /// пишет в строку подсказок, пока фокус не вернётся к обычному окну. Кликер от
+    /// администратора такие окна видит на равных, поэтому там предупреждение было бы ложным.
+    private void UpdateTrustWarning()
+    {
+        if (!_hotkeysRegistered || _selfElevated)
+        {
+            return;
+        }
+
+        var window = Native.GetForegroundWindow();
+        Native.GetWindowThreadProcessId(window, out var pid);
+
+        if (pid == 0)
+        {
+            return;
+        }
+
+        // Права процесса фиксированы при создании, так что токен смотрим один раз на pid,
+        // а не каждые 100 мс.
+        if (pid != _foregroundPid)
+        {
+            _foregroundPid = pid;
+            _foregroundElevated = Native.IsForegroundWindowElevated(window);
+        }
+
+        if (_foregroundElevated == _deliveryBlocked)
+        {
+            return;
+        }
+
+        _deliveryBlocked = _foregroundElevated;
+        _hints.ForeColor = _foregroundElevated ? Color.Firebrick : SystemColors.ControlText;
+        _hints.Text = _foregroundElevated
+            ? "Окно от администратора активно: клики не доходят"
+            : DefaultHints;
     }
 
     private void ShowNote(string message) => OnUi(() => _note.Text = message);

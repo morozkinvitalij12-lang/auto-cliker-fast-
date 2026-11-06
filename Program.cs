@@ -491,6 +491,75 @@ internal static class Program
         [DllImport("shell32.dll")]
         public static extern bool IsUserAnAdmin();
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr OpenProcess(uint dwAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("advapi32.dll")]
+        public static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll")]
+        public static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass,
+            IntPtr tokenInformation, uint length, out uint returnLength);
+
+        private const uint ProcessQueryLimited = 0x1000, TokenQuery = 0x0008;
+        private const int TokenElevation = 20;
+
+        /// true, если процесс активного окна запущен с поднятыми правами. Такое окно по UIPI
+        /// не отдаёт глобальные клавиши чужому процессу и не принимает его клики.
+        public static bool IsForegroundWindowElevated(IntPtr window)
+        {
+            GetWindowThreadProcessId(window, out var pid);
+            if (pid == 0)
+            {
+                return false;
+            }
+
+            var process = OpenProcess(ProcessQueryLimited, false, pid);
+            if (process == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (!OpenProcessToken(process, TokenQuery, out var token))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    var buffer = Marshal.AllocHGlobal(sizeof(int));
+                    try
+                    {
+                        return GetTokenInformation(token, TokenElevation, buffer, sizeof(int), out var _)
+                               && Marshal.ReadInt32(buffer) != 0;
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(buffer);
+                    }
+                }
+                finally
+                {
+                    CloseHandle(token);
+                }
+            }
+            finally
+            {
+                CloseHandle(process);
+            }
+        }
+
         public const int SwHide = 0;
     }
 
