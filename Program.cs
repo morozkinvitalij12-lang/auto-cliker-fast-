@@ -19,6 +19,10 @@ internal static class Program
     internal const int HotCoords = 2;
     internal const int HotQuit = 3;
 
+    /// Метка в dwExtraInfo каждого собственного клика: по ней окно отличает клик кликера
+    /// от клика живой мыши и не путает их при остановке.
+    internal static readonly IntPtr OwnClickTag = new(0x514B434C);
+
     private const string SingleInstanceName = "Local\\autoclicker-single-instance";
 
     private static Mutex? _singleInstance;
@@ -423,7 +427,7 @@ internal static class Program
         private static Input ClickInput(uint flags) => new()
         {
             Type = Native.InputMouse,
-            Mouse = new MouseInput { DwFlags = flags },
+            Mouse = new MouseInput { DwFlags = flags, DwExtraInfo = OwnClickTag },
         };
     }
 
@@ -440,6 +444,17 @@ internal static class Program
         public const uint PmRemove = 0x0001;
         public const uint WmQuit = 0x0012;
         public const uint WmHotkey = 0x0400;
+
+        private const uint WmLButtonDown = 0x0201, WmLButtonUp = 0x0202;
+        private const uint WmRButtonDown = 0x0204, WmRButtonUp = 0x0205;
+        private const uint WmMButtonDown = 0x0207, WmMButtonUp = 0x0208;
+
+        /// Сообщения от любой кнопки мыши — именно на них смотрим метку собственного клика.
+        public static bool IsMouseButtonMessage(uint message) =>
+            message is WmLButtonDown or WmLButtonUp or WmRButtonDown or WmRButtonUp or WmMButtonDown or WmMButtonUp;
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetMessageExtraInfo();
 
         public static readonly IntPtr DpiAwarePerMonitorV2 = new IntPtr(-4);
 

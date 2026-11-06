@@ -27,9 +27,10 @@ internal sealed class MainForm : Form
 
     private CancellationTokenSource? _cts;
     private Engine? _engine;
+    private Thread? _worker;
     private Settings _current;
     private long _lastClicks;
-    private long _startedAt;
+    private bool _ownClickSeen;
 
     public MainForm(Settings defaults)
     {
@@ -110,7 +111,7 @@ internal sealed class MainForm : Form
         Controls.Add(pick);
 
         _toggle = new Button { Text = "▶ Старт (Ctrl+Alt+F3)", Location = new Point(14, 176), Size = new Size(381, 42) };
-        _toggle.Click += (_, _) => ToggleRunning();
+        _toggle.Click += (_, _) => OnToggleClick();
         Controls.Add(_toggle);
 
         _lamp = new Panel { Location = new Point(14, 226), Size = new Size(20, 20) };
@@ -228,6 +229,13 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (Native.IsMouseButtonMessage((uint)message.Msg))
+        {
+            // Метку ставит сам клик кликера (Program.OwnClickTag в dwExtraInfo).
+            // Живое нажатие приходит без неё, поэтому «Стоп» по кнопке всегда настоящий.
+            _ownClickSeen = Native.GetMessageExtraInfo() == Program.OwnClickTag;
+        }
+
         base.WndProc(ref message);
     }
 
@@ -238,8 +246,8 @@ internal sealed class MainForm : Form
         _tray.Dispose();
         _iconOn.Dispose();
         _iconOff.Dispose();
-        _cts?.Cancel();
-        _cts?.Dispose();
+        _engine = null;
+        ShutdownEngine();
         base.OnFormClosed(e);
     }
 
@@ -253,34 +261,35 @@ internal sealed class MainForm : Form
         return Icon.FromHandle(bitmap.GetHicon());
     }
 
+    /// Останавливает и запускает без оговорок: хоткей исходит от живого нажатия,
+    /// и глушить его нельзя ни при каких интервалах.
     private void ToggleRunning()
     {
         if (_engine is null)
         {
             Start();
-            RefreshStatus();
-            return;
+        }
+        else
+        {
+            Stop();
         }
 
-        if (IsOwnSyntheticClick())
+        RefreshStatus();
+    }
+
+    /// Кликер бьёт туда, где курсор, а нажатие «Старт» оставляет курсор ровно на кнопке:
+    /// её же первый синтетический клик и приходился по «Стоп». Такой клик узнаётся по
+    /// метке в dwExtraInfo и игнорируется; живой клик по кнопке останавливает всегда.
+    private void OnToggleClick()
+    {
+        if (_engine is not null && _ownClickSeen)
         {
-            // Собственный клик кликера попал в его же кнопку «Стоп»: отсюда и ощущение,
-            // что приложение «выключается само». Живая мышь сюда не попадает.
             _note.Text = "Кликер кликнул по своей кнопке — убери курсор с окна.";
             RefreshStatus();
             return;
         }
 
-        Stop();
-        RefreshStatus();
-    }
-
-    /// Кликер бьёт туда, где курсор, а старт по кнопке оставляет курсор ровно на кнопке.
-    /// Первый же синтетический клик приходился по «Стоп» и всё гасил, поэтому на время
-    /// одного интервала кнопка не принимает клики: живой клик через мгновение работает.
-    private bool IsOwnSyntheticClick()
-    {
-        return Environment.TickCount64 - _startedAt < _current.IntervalMs + 250;
+        ToggleRunning();
     }
 
     private void Start()
@@ -291,19 +300,19 @@ internal sealed class MainForm : Form
         _engine = new Engine(_current, _cts)
         {
             Report = ShowNote,
-            LimitReached = msg =>
+            LimitReached = msg => OnUi(() =>
             {
-                // Кнопка уже стала «выключен» — пишем причину крупно, чтобы это не выглядело самоотключением.
+                // Кнопка гаснет следом на ближайшем обновлении статуса — пишем причину крупно,
+                // чтобы это не выглядело самоотключением.
                 _lastClicks = _engine?.Clicks ?? _lastClicks;
-                BeginInvoke(() => _note.Text = msg);
+                _note.Text = msg;
                 ShowBalloon(msg);
-            },
+            }),
         };
 
-        var worker = new Thread(_engine.Run) { IsBackground = true, Name = "clicks" };
+        _worker = new Thread(_engine.Run) { IsBackground = true, Name = "clicks" };
         _engine.Toggle();
-        _startedAt = Environment.TickCount64;
-        worker.Start();
+        _worker.Start();
 
         _toggle.Text = "⏹ Стоп (Ctrl+Alt+F3)";
         _note.Text = _current.Count > 0
@@ -330,11 +339,31 @@ internal sealed class MainForm : Form
     private void Stop()
     {
         _lastClicks = _engine?.Clicks ?? _lastClicks;
-        _cts?.Cancel();
-        _cts?.Dispose();
-        _cts = null;
         _engine = null;
+        ShutdownEngine();
         _toggle.Text = "▶ Старт (Ctrl+Alt+F3)";
+    }
+
+    /// Поток кликов может в этот момент звать _shutdown.Cancel() на исчерпанном лимите,
+    /// а Cancel() на уже освобождённом источнике бросает ObjectDisposedException вне UI-потока.
+    /// Поэтому сначала ждём выхода потока, и только потом освобождаем источник.
+    private void ShutdownEngine()
+    {
+        var cts = _cts;
+        var worker = _worker;
+        _cts = null;
+        _worker = null;
+
+        if (cts is null)
+        {
+            return;
+        }
+
+        cts.Cancel();
+        if (worker is null || worker.Join(250))
+        {
+            cts.Dispose();
+        }
     }
 
     private Settings BuildSettings()
@@ -401,18 +430,22 @@ internal sealed class MainForm : Form
         _status.Text = $"интервал {_current.IntervalMs} мс · {where} · {limit} · кликов за запуск: {clicks}";
     }
 
-    private void ShowNote(string message)
+    private void ShowNote(string message) => OnUi(() => _note.Text = message);
+
+    /// Всё, что рабочий поток хочет показать, проходит отсюда: напрямую трогать
+    /// контролы из `clicks` нельзя, а окно к этому моменту может уже закрываться.
+    private void OnUi(Action action)
     {
         try
         {
             if (IsHandleCreated && !IsDisposed)
             {
-                BeginInvoke(() => _note.Text = message);
+                BeginInvoke(action);
             }
         }
-        catch (InvalidOperationException)
+        catch (Exception e) when (e is InvalidOperationException or ObjectDisposedException)
         {
-            // Окно закрывается в момент отчёта — показывать некуда.
+            // Окно закрывается ровно в момент отчёта — показывать некуда.
         }
     }
 
