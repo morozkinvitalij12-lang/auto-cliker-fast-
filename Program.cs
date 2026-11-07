@@ -9,15 +9,88 @@ internal static class Program
 {
     internal const uint ModNoRepeat = 0x4000;
 
-    /// Голый F3 игра перехватывает сама и его же держат другие окна кликера.
-    /// Ctrl+Alt+F3 не конфликтует ни с чем и не крадёт клавишу у игры.
-    internal const uint ModCtrlAlt = 0x0002 | 0x0008;
+    internal const uint ModAlt = 0x0001, ModCtrl = 0x0002, ModShift = 0x0004;
+    internal const uint ModCtrlAlt = ModCtrl | ModAlt;
     internal const uint VkF3 = 0x72;
     internal const uint VkF8 = 0x77;
     internal const uint VkF10 = 0x79;
+    internal const uint VkSpace = 0x20, VkInsert = 0x2D;
     internal const int HotToggle = 1;
     internal const int HotCoords = 2;
     internal const int HotQuit = 3;
+    internal const int HotToggleAlternate = 4;
+
+    internal readonly record struct Hotkey(string Label, uint Mods, uint Vk);
+
+    /// Варианты клавиши старт/стоп. Ряд F на ноутбуках и многих игровых клавиатурах живёт только
+    /// вместе с Fn и перехватывается медиаплеерами, поэтому половина вариантов обходится без него.
+    internal static readonly Hotkey[] ToggleHotkeys =
+    [
+        new("Ctrl+Alt+F3", ModCtrlAlt, VkF3),
+        new("Ctrl+Alt+Space", ModCtrlAlt, VkSpace),
+        new("Ctrl+Shift+F3", ModCtrl | ModShift, VkF3),
+        new("Alt+Insert", ModAlt, VkInsert),
+    ];
+
+    /// Выбор клавиши переживает запуск: дефолтная как раз у того, кто её менял, и не работает.
+    internal static readonly int SavedToggleIndex = ReadSavedToggleIndex();
+
+    /// Метка сохранённой клавиши для текстов консоли: в окне она своя, выбираемая на лету.
+    internal static string SavedToggleLabel => ToggleHotkeys[SavedToggleIndex].Label;
+
+    /// Путь к настройке; null, если %APPDATA% пуст — тогда файл искать в текущей папке
+    /// (например, рядом со скачанным exe) хуже, чем работать без сохранения.
+    private static string? HotkeyFile
+    {
+        get
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return appData.Length == 0
+                ? null
+                : Path.Combine(appData, "autoclicker", "hotkey.txt");
+        }
+    }
+
+    private static int ReadSavedToggleIndex()
+    {
+        var file = HotkeyFile;
+        if (file is null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return int.TryParse(File.ReadAllText(file).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
+                && index >= 0 && index < ToggleHotkeys.Length
+                ? index
+                : 0;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Нет файла или нет доступа к AppData — работаем на дефолтной клавише.
+            return 0;
+        }
+    }
+
+    internal static void SaveToggleIndex(int index)
+    {
+        var file = HotkeyFile;
+        if (file is null)
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+            File.WriteAllText(file, index.ToString(CultureInfo.InvariantCulture));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Настройки — не то, ради чего стоит ронять кликер.
+        }
+    }
 
     /// Метка в dwExtraInfo каждого собственного клика: по ней окно отличает клик кликера
     /// от клика живой мыши и не путает их при остановке.
@@ -68,8 +141,8 @@ internal static class Program
 
         if (AlreadyRunning())
         {
-            const string alreadyRunningText = "Автокликер уже запущен.\n\n"
-                + "Второе окно не сможет перехватить Ctrl+Alt+F3 — клавиша занята первым запуском, "
+            string alreadyRunningText = "Автокликер уже запущен.\n\n"
+                + $"Второе окно не сможет перехватить {SavedToggleLabel} — клавиша занята первым запуском, "
                 + "и будет казаться, что она не работает.\n\n"
                 + "Найди первое окно (значок в трее) и закрой его, либо нажми в нём Ctrl+Alt+F10.";
 
@@ -98,9 +171,15 @@ internal static class Program
         // Marshal.GetLastWin32Error здесь отдаёт 0 — маршаллинг P/Invoke затирает код ошибки,
         // поэтому читаем его напрямую и расшифровыв сами.
         var hotkeyFailures = new List<int>();
-        foreach (var (id, vk) in new (int, uint)[] { (HotToggle, VkF3), (HotCoords, VkF8), (HotQuit, VkF10) })
+        var toggleKey = ToggleHotkeys[SavedToggleIndex];
+        foreach (var (id, mods, vk) in new (int, uint, uint)[]
+                 {
+                     (HotToggle, toggleKey.Mods, toggleKey.Vk),
+                     (HotCoords, ModCtrlAlt, VkF8),
+                     (HotQuit, ModCtrlAlt, VkF10),
+                 })
         {
-            if (!Native.RegisterHotKey(IntPtr.Zero, id, ModCtrlAlt | ModNoRepeat, vk))
+            if (!Native.RegisterHotKey(IntPtr.Zero, id, mods | ModNoRepeat, vk))
             {
                 hotkeyFailures.Add(Marshal.GetLastPInvokeError());
             }
@@ -113,7 +192,7 @@ internal static class Program
         }
 
         Console.WriteLine(settings.Describe());
-        Console.WriteLine("Ctrl+Alt+F3 — включить/выключить   Ctrl+Alt+F8 — показать курсор   Ctrl+Alt+F10 — выход");
+        Console.WriteLine($"{toggleKey.Label} — включить/выключить   Ctrl+Alt+F8 — показать курсор   Ctrl+Alt+F10 — выход");
 
         if (settings.Count > 0)
         {
@@ -225,7 +304,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("""
+        Console.WriteLine($$"""
             autoclicker — шлёт клики мышью через Win32 SendInput
 
             Использование:
@@ -236,17 +315,18 @@ internal static class Program
               --interval <мс>  пауза между кликами, по умолчанию 500, минимум 10
               --button <имя>   left (по умолчанию) | right | middle
               --count <n>      сколько кликов сделать; 0 = без лимита (по умолчанию).
-                               С --count старт сразу, без него — по Ctrl+Alt+F3, процесс ждёт хоткеи.
+                               С --count старт сразу, без него — по клавише старт/стоп, процесс ждёт хоткеи.
               --x/--y <пикс>   фиксированная точка: курсор устанавливается туда перед каждым
                                кликом. Без --x/--y клик идёт туда, где сейчас курсор.
 
-            Горячие клавиши (работают, когда активно любое окно):
-              Ctrl+Alt+F3    включить / выключить клики
-              Ctrl+Alt+F8    вывести текущие координаты курсора
-              Ctrl+Alt+F10   выйти
+            Горячие клавиши (работают и при свёрнутом окне кликера):
+              {{ToggleHotkeys[SavedToggleIndex].Label,-17}}включить / выключить клики
+              Ctrl+Alt+F8      вывести текущие координаты курсора
+              Ctrl+Alt+F10     выйти
 
-            Замечание: сочетания с Ctrl+Alt выбраны специально — голый F3 перехватывает сама
-            игра, и тогда казалось, что клавиша «не работает».
+            Замечание: сочетания с модификаторами выбраны специально — голый F3 перехватывает сама
+            игра, и тогда казалось, что клавиша «не работает». Клавишу старт/стоп можно выбрать в
+            окне; выбор сохраняется в %APPDATA%\autoclicker\hotkey.txt и действует и здесь.
 
             Примеры:
               autoclicker --interval 250
@@ -370,6 +450,9 @@ internal static class Program
 
         public Action<string>? Report { get; set; }
 
+        /// Клавиша в тексте «нажми её — снова включится»: в окне её выбирают на лету.
+        public string ToggleKeyName { get; set; } = SavedToggleLabel;
+
         /// Движок сам выключается на лимите — без этого сообщения выглядит, будто он «умер сам».
         public Action<string>? LimitReached { get; set; }
 
@@ -405,7 +488,7 @@ internal static class Program
                     _shutdown.Cancel();
                     (LimitReached ?? Notify)(
                         $"Лимит исчерпан: {Plural(_settings.Count, "клик", "клика", "кликов")}."
-                        + " Нажми Ctrl+Alt+F3 или Старт — снова включится.");
+                        + $" Нажми {ToggleKeyName} или Старт — снова включится.");
                     continue;
                 }
 
@@ -443,7 +526,7 @@ internal static class Program
 
         public const uint PmRemove = 0x0001;
         public const uint WmQuit = 0x0012;
-        public const uint WmHotkey = 0x0400;
+        public const uint WmHotkey = 0x0312;
 
         private const uint WmLButtonDown = 0x0201, WmLButtonUp = 0x0202;
         private const uint WmRButtonDown = 0x0204, WmRButtonUp = 0x0205;
@@ -513,8 +596,7 @@ internal static class Program
         private const uint ProcessQueryLimited = 0x1000, TokenQuery = 0x0008;
         private const int TokenElevation = 20;
 
-        /// true, если процесс активного окна запущен с поднятыми правами. Такое окно по UIPI
-        /// не отдаёт глобальные клавиши чужому процессу и не принимает его клики.
+        // UIPI блокирует SendInput из процесса с меньшими правами.
         public static bool IsForegroundWindowElevated(IntPtr window)
         {
             GetWindowThreadProcessId(window, out var pid);

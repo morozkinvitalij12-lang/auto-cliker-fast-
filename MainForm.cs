@@ -23,7 +23,11 @@ internal sealed class MainForm : Form
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
     private readonly System.Windows.Forms.Timer _refresh;
+    private readonly System.Windows.Forms.Timer _capture;
     private readonly Label _hints;
+    private readonly ComboBox _hotkey;
+    private readonly ContextMenuStrip _trayMenu;
+    private readonly ToolStripMenuItem _trayToggle;
 
     private CancellationTokenSource? _cts;
     private Engine? _engine;
@@ -31,14 +35,16 @@ internal sealed class MainForm : Form
     private Settings _current;
     private long _lastClicks;
     private bool _ownClickSeen;
-    private bool _hotkeysRegistered = true;
+
+    // Ошибка регистрации не должна скрываться предупреждением о правах активного окна.
+    private int _hotkeyFailure;
+    private int _otherHotkeyFailure;
+    private int _toggleHotkeyId = Program.HotToggle;
+    private int _registeredToggleIndex = -1;
     private bool? _deliveryBlocked;
     private uint _foregroundPid;
     private bool _foregroundElevated;
     private readonly bool _selfElevated = Native.IsUserAnAdmin();
-
-    private const string DefaultHints =
-        "Ctrl+Alt+F3 — старт/стоп    Ctrl+Alt+F8 — координаты    Ctrl+Alt+F10 — выход";
 
     public MainForm(Settings defaults)
     {
@@ -49,7 +55,7 @@ internal sealed class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(410, 326);
+        ClientSize = new Size(410, 372);
 
         Controls.Add(new Label { Text = "Интервал, мс", Location = new Point(14, 17), AutoSize = true });
         _interval = NewNumber(10, 60_000, defaults.IntervalMs);
@@ -115,42 +121,60 @@ internal sealed class MainForm : Form
             Location = new Point(240, 133),
             Size = new Size(155, 30),
         };
-        pick.Click += (_, _) => CaptureCursorPoint();
+        pick.Click += (_, _) => BeginCapture();
         Controls.Add(pick);
 
-        _toggle = new Button { Text = "▶ Старт (Ctrl+Alt+F3)", Location = new Point(14, 176), Size = new Size(381, 42) };
+        _toggle = new Button { Text = "▶ Старт", Location = new Point(14, 176), Size = new Size(381, 42) };
         _toggle.Click += (_, _) => OnToggleClick();
         Controls.Add(_toggle);
 
-        _lamp = new Panel { Location = new Point(14, 226), Size = new Size(20, 20) };
+        Controls.Add(new Label { Text = "Клавиша старт/стоп", Location = new Point(14, 227), AutoSize = true });
+        _hotkey = new ComboBox
+        {
+            Location = new Point(200, 224),
+            Size = new Size(195, 28),
+            DropDownStyle = ComboBoxStyle.DropDownList,
+        };
+        foreach (var preset in Program.ToggleHotkeys)
+        {
+            _hotkey.Items.Add(preset.Label);
+        }
+
+        // Выбор ставим до подписки: иначе инициализация сама себя просит пересохранять настройку.
+        _hotkey.SelectedIndex = Program.SavedToggleIndex;
+        _hotkey.SelectedIndexChanged += (_, _) => ApplyToggleHotkey();
+        Controls.Add(_hotkey);
+
+        _lamp = new Panel { Location = new Point(14, 256), Size = new Size(20, 20) };
         Controls.Add(_lamp);
 
         _stateLabel = new Label
         {
-            Location = new Point(44, 226),
+            Location = new Point(44, 256),
             Size = new Size(351, 22),
             AutoSize = false,
             Font = new Font(Font, FontStyle.Bold),
         };
         Controls.Add(_stateLabel);
 
-        _status = new Label { Location = new Point(14, 254), Size = new Size(381, 22), AutoSize = false };
+        _status = new Label { Location = new Point(14, 284), Size = new Size(381, 22), AutoSize = false };
         Controls.Add(_status);
 
         _note = new Label
         {
-            Location = new Point(14, 278),
+            Location = new Point(14, 308),
             Size = new Size(381, 22),
             AutoSize = false,
             ForeColor = Color.Firebrick,
         };
         Controls.Add(_note);
 
+        // Две строки: список комбинаций в 381 пиксель по ширине не помещается, а обрезать
+        // подсказку про клавиши хуже, чем отвезти ей место.
         _hints = new Label
         {
-            Text = DefaultHints,
-            Location = new Point(14, 300),
-            Size = new Size(381, 20),
+            Location = new Point(14, 330),
+            Size = new Size(381, 34),
             AutoSize = false,
         };
         Controls.Add(_hints);
@@ -163,17 +187,40 @@ internal sealed class MainForm : Form
             Visible = true,
             Text = "Автокликер: выключен",
         };
-        _tray.DoubleClick += (_, _) =>
+        // Меню в трее — путь без клавиатуры: он работает и над админ-окном, и когда клавиши
+        // заняты чужим приложением. Одиночный клик по значку просто возвращает окно.
+        _trayToggle = new ToolStripMenuItem();
+        _trayToggle.Click += (_, _) => ToggleRunning();
+        var trayCapture = new ToolStripMenuItem("Взять позицию курсора");
+        trayCapture.Click += (_, _) => BeginCapture();
+        var trayExit = new ToolStripMenuItem("Выход");
+        trayExit.Click += (_, _) => Close();
+        _trayMenu = new ContextMenuStrip();
+        _trayMenu.Items.AddRange(new ToolStripItem[] { _trayToggle, trayCapture, new ToolStripSeparator(), trayExit });
+
+        _tray.ContextMenuStrip = _trayMenu;
+        _tray.MouseClick += (_, e) =>
         {
-            WindowState = FormWindowState.Normal;
-            Activate();
+            if (e.Button == MouseButtons.Left)
+            {
+                RestoreFromTray();
+            }
         };
+        _tray.DoubleClick += (_, _) => RestoreFromTray();
 
         _refresh = new System.Windows.Forms.Timer { Interval = 100 };
         _refresh.Tick += (_, _) => RefreshStatus();
         _refresh.Start();
 
+        _capture = new System.Windows.Forms.Timer { Interval = 3000 };
+        _capture.Tick += (_, _) =>
+        {
+            _capture.Stop();
+            CaptureCursorPoint();
+        };
+
         UpdateTargetEnabled();
+        UpdateKeyLabels();
         RefreshStatus();
     }
 
@@ -183,38 +230,112 @@ internal sealed class MainForm : Form
 
         if (!_selfElevated)
         {
-            _note.Text = "Кликер не от администратора: над окнами с правами выше (игра из-под admin) "
-                + "ни Ctrl+Alt+F3, ни клики не работают.";
+            _note.Text = "Клики в окно от администратора требуют таких же прав у кликера.";
         }
 
-        var failures = new List<int>();
-        foreach (var (id, vk) in new (int, uint)[]
+        RegisterHotkeys();
+    }
+
+    private void RegisterHotkeys()
+    {
+        var toggle = Program.ToggleHotkeys[_hotkey.SelectedIndex];
+        var failure = 0;
+        _registeredToggleIndex = -1;
+        _otherHotkeyFailure = 0;
+
+        foreach (var (id, mods, vk) in new (int, uint, uint)[]
                  {
-                     (Program.HotToggle, Program.VkF3),
-                     (Program.HotCoords, Program.VkF8),
-                     (Program.HotQuit, Program.VkF10),
+                     (_toggleHotkeyId, toggle.Mods, toggle.Vk),
+                     (Program.HotCoords, Program.ModCtrlAlt, Program.VkF8),
+                     (Program.HotQuit, Program.ModCtrlAlt, Program.VkF10),
                  })
         {
-            if (!Native.RegisterHotKey(Handle, id, Program.ModCtrlAlt | Program.ModNoRepeat, vk))
+            Native.UnregisterHotKey(Handle, id);
+            if (Native.RegisterHotKey(Handle, id, mods | Program.ModNoRepeat, vk))
             {
-                failures.Add(Marshal.GetLastPInvokeError());
+                if (id == _toggleHotkeyId)
+                {
+                    _registeredToggleIndex = _hotkey.SelectedIndex;
+                }
+            }
+            else
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (failure == 0)
+                {
+                    failure = error;
+                }
+
+                if (id != _toggleHotkeyId && _otherHotkeyFailure == 0)
+                {
+                    _otherHotkeyFailure = error;
+                }
             }
         }
 
-        _hotkeysRegistered = failures.Count == 0;
-        if (failures.Count > 0)
+        _hotkeyFailure = failure;
+        _deliveryBlocked = null;
+        ReportHotkeys(failure);
+    }
+
+    /// Нижняя строка всегда отвечает за клавиши: либо список комбинаций, либо почему они молчат.
+    private void ReportHotkeys(int failureCode)
+    {
+        _hints.ForeColor = failureCode == 0 ? SystemColors.ControlText : Color.Firebrick;
+        _hints.Text = failureCode == 0 ? HintsText() : $"Горячие клавиши заняты: {Program.Win32Message(failureCode)}";
+    }
+
+    private void ApplyToggleHotkey()
+    {
+        if (!IsHandleCreated || _hotkey.SelectedIndex == _registeredToggleIndex)
         {
-            // Строка подсказок внизу краснеет: видно, что F3 мёртв не из-за поломки кликера.
-            _hints.ForeColor = Color.Firebrick;
-            _hints.Text = $"Горячие клавиши заняты: {Program.Win32Message(failures[0])}";
+            return;
         }
+
+        var toggle = Program.ToggleHotkeys[_hotkey.SelectedIndex];
+        var nextId = _toggleHotkeyId == Program.HotToggle ? Program.HotToggleAlternate : Program.HotToggle;
+
+        // Второй id позволяет проверить новое сочетание, не теряя рабочую клавишу остановки.
+        if (!Native.RegisterHotKey(Handle, nextId, toggle.Mods | Program.ModNoRepeat, toggle.Vk))
+        {
+            var error = Marshal.GetLastPInvokeError();
+            if (_registeredToggleIndex >= 0)
+            {
+                _hotkey.SelectedIndex = _registeredToggleIndex;
+                _note.Text = $"Смена отклонена ({error}); работает {ToggleKeyLabel}.";
+            }
+            else
+            {
+                _hotkeyFailure = error;
+                ReportHotkeys(error);
+                UpdateKeyLabels();
+            }
+
+            return;
+        }
+
+        Native.UnregisterHotKey(Handle, _toggleHotkeyId);
+        _toggleHotkeyId = nextId;
+        _registeredToggleIndex = _hotkey.SelectedIndex;
+        _hotkeyFailure = _otherHotkeyFailure;
+        _deliveryBlocked = null;
+        Program.SaveToggleIndex(_registeredToggleIndex);
+
+        if (_engine is not null)
+        {
+            _engine.ToggleKeyName = toggle.Label;
+        }
+
+        ReportHotkeys(_hotkeyFailure);
+        UpdateKeyLabels();
     }
 
     protected override void OnHandleDestroyed(EventArgs e)
     {
-        Native.UnregisterHotKey(Handle, Program.HotToggle);
+        Native.UnregisterHotKey(Handle, _toggleHotkeyId);
         Native.UnregisterHotKey(Handle, Program.HotCoords);
         Native.UnregisterHotKey(Handle, Program.HotQuit);
+        _registeredToggleIndex = -1;
         base.OnHandleDestroyed(e);
     }
 
@@ -225,6 +346,7 @@ internal sealed class MainForm : Form
             switch ((int)message.WParam)
             {
                 case Program.HotToggle:
+                case Program.HotToggleAlternate:
                     ToggleRunning();
                     break;
                 case Program.HotCoords:
@@ -251,8 +373,10 @@ internal sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _refresh.Dispose();
+        _capture.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
+        _trayMenu.Dispose();
         _iconOn.Dispose();
         _iconOff.Dispose();
         _engine = null;
@@ -306,8 +430,15 @@ internal sealed class MainForm : Form
 
     private void Start()
     {
+        if (_capture.Enabled)
+        {
+            _note.Text = "Сначала дождись захвата точки.";
+            ShowBalloon(_note.Text);
+            return;
+        }
+
         // Убираем окно с дороги до первого клика: иначе первый же синтетический клик
-        // приходится в собственные контролы. Возврат — из трея двойным кликом или из панели.
+        // приходится в собственные контролы. Возврат — клик по значку в трее или панель.
         WindowState = FormWindowState.Minimized;
 
         _current = BuildSettings();
@@ -315,6 +446,7 @@ internal sealed class MainForm : Form
         _cts = new CancellationTokenSource();
         _engine = new Engine(_current, _cts)
         {
+            ToggleKeyName = ToggleKeyLabel,
             Report = ShowNote,
             LimitReached = msg => OnUi(() =>
             {
@@ -330,17 +462,17 @@ internal sealed class MainForm : Form
         _engine.Toggle();
         _worker.Start();
 
-        _toggle.Text = "⏹ Стоп (Ctrl+Alt+F3)";
+        UpdateKeyLabels();
         _note.Text = _current.Count > 0
             ? $"Лимит: {_current.Count} — после него кликер сам погаснет, это не поломка."
-            : "Клики идут без лимита — Ctrl+Alt+F3 или кнопка остановят.";
+            : $"Клики идут без лимита — {ToggleKeyLabel} или кнопка остановят.";
 
         if (!_current.HasTarget)
         {
             _note.Text = "Кликер бьёт туда, где курсор: держи его вне этого окна.";
         }
 
-        ShowBalloon("Включён и свёрнут. Ctrl+Alt+F3 — стоп, двойной клик по значку — окно.");
+        ShowBalloon($"Включён и свёрнут. {ToggleKeyLabel} — стоп, клик по значку в трее — окно.");
     }
 
     private void ShowBalloon(string message)
@@ -359,7 +491,40 @@ internal sealed class MainForm : Form
         _lastClicks = _engine?.Clicks ?? _lastClicks;
         _engine = null;
         ShutdownEngine();
-        _toggle.Text = "▶ Старт (Ctrl+Alt+F3)";
+        UpdateKeyLabels();
+    }
+
+    private string ToggleKeyLabel => Program.ToggleHotkeys[_hotkey.SelectedIndex].Label;
+
+    private string StartLabel(bool running) => (running ? "⏹ Стоп (" : "▶ Старт (") + ToggleKeyLabel + ")";
+
+    /// Кнопка и пункт меню в трее всегда показывают ту клавишу, которая сейчас зарегистрирована.
+    private void UpdateKeyLabels()
+    {
+        var label = StartLabel(_engine is not null);
+        _toggle.Text = label;
+        _trayToggle.Text = label;
+    }
+
+    private string HintsText() =>
+        $"{ToggleKeyLabel} — старт/стоп    Ctrl+Alt+F8 — координаты    Ctrl+Alt+F10 — выход";
+
+    /// Курсор в момент клика по кнопке стоит на самой кнопке, поэтому точку запоминаем не сразу,
+    /// а через паузу: за три секунды курсор успевает уйти в нужное место.
+    private void BeginCapture()
+    {
+        _capture.Stop();
+        _note.Text = "Три секунды: поставь курсор в точку клика.";
+
+        // Из трея окно свёрнуто и _note невидим — поэтому то же самое уходит во всплывашку.
+        ShowBalloon("Три секунды: поставь курсор в точку клика.");
+        _capture.Start();
+    }
+
+    private void RestoreFromTray()
+    {
+        WindowState = FormWindowState.Normal;
+        Activate();
     }
 
     /// Поток кликов может в этот момент звать _shutdown.Cancel() на исчерпанном лимите,
@@ -408,6 +573,7 @@ internal sealed class MainForm : Form
 
     private void CaptureCursorPoint()
     {
+        _capture.Stop();
         if (!Native.GetCursorPos(out var point))
         {
             _note.Text = "Не удалось прочитать позицию курсора.";
@@ -455,7 +621,7 @@ internal sealed class MainForm : Form
     /// администратора такие окна видит на равных, поэтому там предупреждение было бы ложным.
     private void UpdateTrustWarning()
     {
-        if (!_hotkeysRegistered || _selfElevated)
+        if (_hotkeyFailure != 0 || _selfElevated)
         {
             return;
         }
@@ -485,7 +651,7 @@ internal sealed class MainForm : Form
         _hints.ForeColor = _foregroundElevated ? Color.Firebrick : SystemColors.ControlText;
         _hints.Text = _foregroundElevated
             ? "Окно от администратора активно: клики не доходят"
-            : DefaultHints;
+            : HintsText();
     }
 
     private void ShowNote(string message) => OnUi(() => _note.Text = message);
