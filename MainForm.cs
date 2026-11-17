@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using Engine = AutoClicker.Program.Engine;
 using Native = AutoClicker.Program.Native;
@@ -7,34 +9,50 @@ namespace AutoClicker;
 
 internal sealed class MainForm : Form
 {
-    private readonly NumericUpDown _interval;
-    private readonly ComboBox _button;
-    private readonly NumericUpDown _count;
-    private readonly CheckBox _limit;
-    private readonly CheckBox _fixedPoint;
-    private readonly NumericUpDown _targetX;
-    private readonly NumericUpDown _targetY;
-    private readonly Button _toggle;
-    private readonly Panel _lamp;
-    private readonly Label _stateLabel;
-    private readonly Label _status;
-    private readonly Label _note;
+    private const double WindowOpacity = 0.92;
+
+    private readonly bool _animations;
+
+    private readonly TextBox _interval;
+    private readonly TextBox _count;
+    private readonly TextBox _targetX;
+    private readonly TextBox _targetY;
+    private readonly GlassButton _keyPill;
+    private readonly GlassButton _startBtn;
+    private readonly GlassButton _modeRow;
+    private readonly GlassButton _buttonRow;
+    private readonly GlassButton _pointRow;
+    private readonly GlassButton _captureTile;
+    private readonly GlassButton _limitRow;
+    private readonly GlassButton _hideLink;
+    private readonly GlassButton _exitLink;
+    private readonly Label _helper;
+
+    private readonly Font _brandFont;
+    private readonly Font _metaFont;
+
     private readonly NotifyIcon _tray;
     private readonly Icon _iconOn;
     private readonly Icon _iconOff;
-    private readonly System.Windows.Forms.Timer _refresh;
-    private readonly System.Windows.Forms.Timer _capture;
-    private readonly Label _hints;
-    private readonly ComboBox _hotkey;
     private readonly ContextMenuStrip _trayMenu;
     private readonly ToolStripMenuItem _trayToggle;
+    private readonly System.Windows.Forms.Timer _refresh;
+    private readonly System.Windows.Forms.Timer _capture;
+    private readonly System.Windows.Forms.Timer _fade;
+    private readonly Stopwatch _fadeWatch = new();
+
+    private int _buttonIndex;
+    private bool _holdOn;
+    private bool _limitOn;
+    private bool _fixedOn;
+    private int _hotkeyIndex;
+    private string _noteText = string.Empty;
 
     private CancellationTokenSource? _cts;
     private Engine? _engine;
     private Thread? _worker;
     private Settings _current;
     private long _lastClicks;
-    private bool _ownClickSeen;
 
     // Ошибка регистрации не должна скрываться предупреждением о правах активного окна.
     private int _hotkeyFailure;
@@ -46,166 +64,174 @@ internal sealed class MainForm : Form
     private bool _foregroundElevated;
     private readonly bool _selfElevated = Native.IsUserAnAdmin();
 
+    private static readonly string[] ButtonLabels = ["левая", "правая", "средняя"];
+
     public MainForm(Settings defaults)
     {
         _current = defaults;
+        _animations = AnimationsEnabled();
+        _buttonIndex = defaults.ButtonName switch { "right" => 1, "middle" => 2, _ => 0 };
+        _holdOn = defaults.HoldMode;
+        _limitOn = defaults.Count > 0;
+        _fixedOn = defaults.HasTarget;
+        _hotkeyIndex = Program.SavedToggleIndex;
 
         Text = "Автокликер";
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        FormBorderStyle = FormBorderStyle.None;
         MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(410, 372);
+        AutoScaleDimensions = new SizeF(DeviceDpi, DeviceDpi);
+        KeyPreview = true;
+        Opacity = WindowOpacity;
+        BackColor = Theme.BgBottom;
+        ClientSize = new Size(S(720), S(328));
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+            | ControlStyles.OptimizedDoubleBuffer, true);
 
-        Controls.Add(new Label { Text = "Интервал, мс", Location = new Point(14, 17), AutoSize = true });
-        _interval = NewNumber(10, 60_000, defaults.IntervalMs);
-        _interval.Location = new Point(200, 14);
+        _brandFont = Theme.UiFont(9);
+        _metaFont = Theme.UiFont(9);
+
+        _interval = NewInput(24, 52, 94, 32, 18, defaults.IntervalMs.ToString(), light: true);
+        _interval.AccessibleName = "Интервал между кликами, миллисекунды";
+        _interval.MaxLength = 5;
+        _interval.TabIndex = 1;
         Controls.Add(_interval);
 
-        Controls.Add(new Label { Text = "Кнопка", Location = new Point(14, 47), AutoSize = true });
-        _button = new ComboBox
-        {
-            Location = new Point(200, 41),
-            Size = new Size(110, 28),
-            DropDownStyle = ComboBoxStyle.DropDownList,
-        };
-        _button.Items.AddRange(new object[] { "Левая", "Правая", "Средняя" });
-        _button.SelectedIndex = defaults.ButtonName switch { "right" => 1, "middle" => 2, _ => 0 };
-        Controls.Add(_button);
-
-        // Лимит по умолчанию выключен: включённое поле со значением «1» раньше останавливало
-        // кликер после одного клика, и это выглядело как «выключает сам себя».
-        Controls.Add(new Label { Text = "Кликов", Location = new Point(14, 77), AutoSize = true });
-
-        _count = NewNumber(1, 1_000_000, Math.Max(1, defaults.Count));
-        _count.Location = new Point(270, 74);
-        _count.Width = 80;
+        _targetX = NewInput(430, 179, 80, 24, 9.5f, defaults.X.ToString());
+        _targetX.AccessibleName = "Координата X";
+        _targetX.MaxLength = 6;
+        _targetX.TabIndex = 6;
+        Controls.Add(_targetX);
+        _targetY = NewInput(554, 179, 80, 24, 9.5f, defaults.Y.ToString());
+        _targetY.AccessibleName = "Координата Y";
+        _targetY.MaxLength = 6;
+        _targetY.TabIndex = 7;
+        Controls.Add(_targetY);
+        _count = NewInput(280, 219, 112, 24, 9.5f, Math.Max(1, defaults.Count).ToString());
+        _count.AccessibleName = "Лимит кликов";
+        _count.MaxLength = 7;
+        _count.TabIndex = 10;
         Controls.Add(_count);
 
-        _limit = new CheckBox
+        _keyPill = new GlassButton
         {
-            Text = "лимит",
-            Location = new Point(200, 74),
-            AutoSize = true,
-            Checked = defaults.Count > 0,
+            Location = new Point(S(536), S(12)),
+            Size = new Size(S(160), S(28)),
+            Pill = true,
+            TextSize = 9,
+            TextColor = Theme.Dim,
+            Text = SpacedKeyLabel,
+            AccessibleName = "Сменить сочетание старт/стоп",
+            TabIndex = 0,
         };
-        _limit.CheckedChanged += (_, _) => _count.Enabled = _limit.Checked;
-        Controls.Add(_limit);
-        _count.Enabled = _limit.Checked;
+        _keyPill.Click += (_, _) => CycleHotkey();
+        Controls.Add(_keyPill);
 
-        _fixedPoint = new CheckBox
+        _startBtn = new GlassButton
         {
-            Text = "Фиксированная точка",
-            Location = new Point(14, 106),
-            AutoSize = true,
-            Checked = defaults.HasTarget,
+            Location = new Point(S(596), S(52)),
+            Size = new Size(S(100), S(32)),
+            Flat = true,
+            TextSize = 10,
+            Text = "старт",
+            Glyph = GlyphKind.Play,
+            TabIndex = 2,
         };
-        _fixedPoint.CheckedChanged += (_, _) => UpdateTargetEnabled();
-        Controls.Add(_fixedPoint);
+        _startBtn.Click += (_, _) => ToggleRunning();
+        Controls.Add(_startBtn);
 
-        Controls.Add(new Label { Text = "X", Location = new Point(14, 138), AutoSize = true });
-        _targetX = NewNumber(-32_768, 32_768, defaults.X);
-        _targetX.Location = new Point(36, 135);
-        _targetX.Size = new Size(80, 28);
-        Controls.Add(_targetX);
-
-        Controls.Add(new Label { Text = "Y", Location = new Point(126, 138), AutoSize = true });
-        _targetY = NewNumber(-32_768, 32_768, defaults.Y);
-        _targetY.Location = new Point(148, 135);
-        _targetY.Size = new Size(80, 28);
-        Controls.Add(_targetY);
-
-        var pick = new Button
+        _modeRow = new GlassButton
         {
-            Text = "Взять позицию курсора",
-            Location = new Point(240, 133),
-            Size = new Size(155, 30),
+            Location = new Point(S(16), S(104)),
+            Size = new Size(S(688), S(56)),
+            Flat = true,
+            Bold = true,
+            TextSize = 10.5f,
+            Glyph = GlyphKind.Play,
+            Text = "клики",
+            AccessibleName = "Сменить режим: клики или зажатие",
+            TabIndex = 3,
         };
-        pick.Click += (_, _) => BeginCapture();
-        Controls.Add(pick);
+        _modeRow.Click += (_, _) => { _holdOn = !_holdOn; UpdateControls(); };
+        Controls.Add(_modeRow);
 
-        _toggle = new Button { Text = "▶ Старт", Location = new Point(14, 176), Size = new Size(381, 42) };
-        _toggle.Click += (_, _) => OnToggleClick();
-        Controls.Add(_toggle);
+        _buttonRow = NewOption(16, 172, 176, "левая кнопка");
+        _buttonRow.AccessibleName = "Сменить кнопку мыши";
+        _buttonRow.TabIndex = 4;
+        _buttonRow.Click += (_, _) => { _buttonIndex = (_buttonIndex + 1) % 3; UpdateControls(); };
+        Controls.Add(_buttonRow);
 
-        Controls.Add(new Label { Text = "Клавиша старт/стоп", Location = new Point(14, 227), AutoSize = true });
-        _hotkey = new ComboBox
+        _pointRow = NewOption(200, 172, 196, "где курсор");
+        _pointRow.AccessibleName = "Сменить цель: курсор или фиксированная точка";
+        _pointRow.TabIndex = 5;
+        _pointRow.Click += (_, _) => { _fixedOn = !_fixedOn; UpdateControls(); };
+        Controls.Add(_pointRow);
+
+        _captureTile = new GlassButton
         {
-            Location = new Point(200, 224),
-            Size = new Size(195, 28),
-            DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(S(656), S(172)),
+            Size = new Size(S(40), S(32)),
+            Flat = true,
+            Glyph = GlyphKind.Crosshair,
+            TextColor = Theme.Dim,
+            AccessibleName = "Запомнить позицию курсора через три секунды",
+            TabIndex = 8,
         };
-        foreach (var preset in Program.ToggleHotkeys)
+        _captureTile.Click += (_, _) => BeginCapture();
+        Controls.Add(_captureTile);
+
+        _limitRow = NewOption(16, 212, 176, "без лимита");
+        _limitRow.AccessibleName = "Включить или выключить лимит кликов";
+        _limitRow.TabIndex = 9;
+        _limitRow.Click += (_, _) => { _limitOn = !_limitOn; UpdateControls(); };
+        Controls.Add(_limitRow);
+
+        _helper = new Label
         {
-            _hotkey.Items.Add(preset.Label);
+            Location = new Point(S(24), S(252)),
+            Size = new Size(S(672), S(36)),
+            AutoSize = false,
+            AutoEllipsis = true,
+            BackColor = Color.Transparent,
+            ForeColor = Theme.Dim,
+            Font = Theme.UiFont(9),
+            UseMnemonic = false,
+        };
+        Controls.Add(_helper);
+
+        _hideLink = NewOption(548, 292, 80, "скрыть");
+        _hideLink.TabIndex = 11;
+        _hideLink.Click += (_, _) => HideToTray();
+        Controls.Add(_hideLink);
+        _exitLink = NewOption(636, 292, 68, "выйти");
+        _exitLink.TabIndex = 12;
+        _exitLink.Click += (_, _) => Close();
+        Controls.Add(_exitLink);
+
+        foreach (var input in new[] { _interval, _targetX, _targetY, _count })
+        {
+            input.GotFocus += (_, _) => Invalidate();
+            input.LostFocus += (_, _) => NormalizeInputs();
         }
-
-        // Выбор ставим до подписки: иначе инициализация сама себя просит пересохранять настройку.
-        _hotkey.SelectedIndex = Program.SavedToggleIndex;
-        _hotkey.SelectedIndexChanged += (_, _) => ApplyToggleHotkey();
-        Controls.Add(_hotkey);
-
-        _lamp = new Panel { Location = new Point(14, 256), Size = new Size(20, 20) };
-        Controls.Add(_lamp);
-
-        _stateLabel = new Label
-        {
-            Location = new Point(44, 256),
-            Size = new Size(351, 22),
-            AutoSize = false,
-            Font = new Font(Font, FontStyle.Bold),
-        };
-        Controls.Add(_stateLabel);
-
-        _status = new Label { Location = new Point(14, 284), Size = new Size(381, 22), AutoSize = false };
-        Controls.Add(_status);
-
-        _note = new Label
-        {
-            Location = new Point(14, 308),
-            Size = new Size(381, 22),
-            AutoSize = false,
-            ForeColor = Color.Firebrick,
-        };
-        Controls.Add(_note);
-
-        // Две строки: список комбинаций в 381 пиксель по ширине не помещается, а обрезать
-        // подсказку про клавиши хуже, чем отвезти ей место.
-        _hints = new Label
-        {
-            Location = new Point(14, 330),
-            Size = new Size(381, 34),
-            AutoSize = false,
-        };
-        Controls.Add(_hints);
 
         _iconOn = MakeStateIcon(Color.FromArgb(0, 175, 90));
         _iconOff = MakeStateIcon(Color.FromArgb(150, 150, 150));
-        _tray = new NotifyIcon
-        {
-            Icon = _iconOff,
-            Visible = true,
-            Text = "Автокликер: выключен",
-        };
-        // Меню в трее — путь без клавиатуры: он работает и над админ-окном, и когда клавиши
-        // заняты чужим приложением. Одиночный клик по значку просто возвращает окно.
+        _tray = new NotifyIcon { Icon = _iconOff, Visible = true, Text = "Автокликер: выключен" };
+
+        // Меню в трее — путь без клавиатуры: работает и над админ-окном, и когда клавиши заняты.
         _trayToggle = new ToolStripMenuItem();
         _trayToggle.Click += (_, _) => ToggleRunning();
-        var trayCapture = new ToolStripMenuItem("Взять позицию курсора");
+        var trayCapture = new ToolStripMenuItem("взять позицию курсора");
         trayCapture.Click += (_, _) => BeginCapture();
-        var trayExit = new ToolStripMenuItem("Выход");
+        var trayExit = new ToolStripMenuItem("выход");
         trayExit.Click += (_, _) => Close();
         _trayMenu = new ContextMenuStrip();
         _trayMenu.Items.AddRange(new ToolStripItem[] { _trayToggle, trayCapture, new ToolStripSeparator(), trayExit });
-
         _tray.ContextMenuStrip = _trayMenu;
-        _tray.MouseClick += (_, e) =>
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                RestoreFromTray();
-            }
-        };
+        _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) RestoreFromTray(); };
         _tray.DoubleClick += (_, _) => RestoreFromTray();
 
         _refresh = new System.Windows.Forms.Timer { Interval = 100 };
@@ -213,32 +239,87 @@ internal sealed class MainForm : Form
         _refresh.Start();
 
         _capture = new System.Windows.Forms.Timer { Interval = 3000 };
-        _capture.Tick += (_, _) =>
+        _capture.Tick += (_, _) => { _capture.Stop(); CaptureCursorPoint(); };
+
+        _fade = new System.Windows.Forms.Timer { Interval = 16 };
+        _fade.Tick += (_, _) =>
         {
-            _capture.Stop();
-            CaptureCursorPoint();
+            var t = _fadeWatch.ElapsedMilliseconds / 160f;
+            if (t >= 1) { Opacity = WindowOpacity; _fade.Stop(); }
+            else Opacity = WindowOpacity * t;
         };
 
-        UpdateTargetEnabled();
+        UpdateControls();
         UpdateKeyLabels();
         RefreshStatus();
     }
 
+    private int S(int value) => (int)MathF.Round(value * DeviceDpi / 96f);
+
+    private string SpacedKeyLabel => ToggleKeyLabel.Replace("+", " + ");
+
+    private TextBox NewInput(int x, int y, int w, int h, float size, string text, bool light = false) => new()
+    {
+        BorderStyle = BorderStyle.None,
+        BackColor = Theme.BgBottom,
+        ForeColor = Theme.Fg,
+        Font = Theme.UiFont(size, light: light),
+        Text = text,
+        Location = new Point(S(x), S(y)),
+        Size = new Size(S(w), S(h)),
+    };
+
+    private GlassButton NewOption(int x, int y, int width, string text) => new()
+    {
+        Location = new Point(S(x), S(y)),
+        Size = new Size(S(width), S(32)),
+        Flat = true,
+        TextSize = 9.5f,
+        TextColor = Theme.Dim,
+        TextAlign = StringAlignment.Near,
+        Text = text,
+    };
+
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-
-        if (!_selfElevated)
-        {
-            _note.Text = "Клики в окно от администратора требуют таких же прав у кликера.";
-        }
-
+        ApplyRegion();
         RegisterHotkeys();
     }
 
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        FadeIn();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (IsHandleCreated) ApplyRegion();
+    }
+
+    private void ApplyRegion()
+    {
+        var old = Region;
+        using var path = Theme.Round(new RectangleF(0, 0, ClientSize.Width, ClientSize.Height), S(24));
+        Region = new Region(path);
+        old?.Dispose();
+    }
+
+    private void FadeIn()
+    {
+        if (!_animations) { Opacity = WindowOpacity; return; }
+        Opacity = 0;
+        _fadeWatch.Restart();
+        _fade.Start();
+    }
+
+    private void HideToTray() => Hide();
+
     private void RegisterHotkeys()
     {
-        var toggle = Program.ToggleHotkeys[_hotkey.SelectedIndex];
+        var toggle = Program.ToggleHotkeys[_hotkeyIndex];
         var failure = 0;
         _registeredToggleIndex = -1;
         _otherHotkeyFailure = 0;
@@ -253,81 +334,57 @@ internal sealed class MainForm : Form
             Native.UnregisterHotKey(Handle, id);
             if (Native.RegisterHotKey(Handle, id, mods | Program.ModNoRepeat, vk))
             {
-                if (id == _toggleHotkeyId)
-                {
-                    _registeredToggleIndex = _hotkey.SelectedIndex;
-                }
+                if (id == _toggleHotkeyId) _registeredToggleIndex = _hotkeyIndex;
             }
             else
             {
                 var error = Marshal.GetLastPInvokeError();
-                if (failure == 0)
-                {
-                    failure = error;
-                }
-
-                if (id != _toggleHotkeyId && _otherHotkeyFailure == 0)
-                {
-                    _otherHotkeyFailure = error;
-                }
+                if (failure == 0) failure = error;
+                if (id != _toggleHotkeyId && _otherHotkeyFailure == 0) _otherHotkeyFailure = error;
             }
         }
 
         _hotkeyFailure = failure;
         _deliveryBlocked = null;
-        ReportHotkeys(failure);
+        RefreshHelper();
     }
 
-    /// Нижняя строка всегда отвечает за клавиши: либо список комбинаций, либо почему они молчат.
-    private void ReportHotkeys(int failureCode)
+    private void CycleHotkey()
     {
-        _hints.ForeColor = failureCode == 0 ? SystemColors.ControlText : Color.Firebrick;
-        _hints.Text = failureCode == 0 ? HintsText() : $"Горячие клавиши заняты: {Program.Win32Message(failureCode)}";
-    }
-
-    private void ApplyToggleHotkey()
-    {
-        if (!IsHandleCreated || _hotkey.SelectedIndex == _registeredToggleIndex)
-        {
-            return;
-        }
-
-        var toggle = Program.ToggleHotkeys[_hotkey.SelectedIndex];
+        if (!IsHandleCreated) return;
         var nextId = _toggleHotkeyId == Program.HotToggle ? Program.HotToggleAlternate : Program.HotToggle;
-
-        // Второй id позволяет проверить новое сочетание, не теряя рабочую клавишу остановки.
-        if (!Native.RegisterHotKey(Handle, nextId, toggle.Mods | Program.ModNoRepeat, toggle.Vk))
+        var error = 0;
+        for (var offset = 1; offset <= Program.ToggleHotkeys.Length; offset++)
         {
-            var error = Marshal.GetLastPInvokeError();
-            if (_registeredToggleIndex >= 0)
+            var next = (_hotkeyIndex + offset) % Program.ToggleHotkeys.Length;
+            if (next == _registeredToggleIndex) continue;
+            var toggle = Program.ToggleHotkeys[next];
+            if (!Native.RegisterHotKey(Handle, nextId, toggle.Mods | Program.ModNoRepeat, toggle.Vk))
             {
-                _hotkey.SelectedIndex = _registeredToggleIndex;
-                _note.Text = $"Смена отклонена ({error}); работает {ToggleKeyLabel}.";
-            }
-            else
-            {
-                _hotkeyFailure = error;
-                ReportHotkeys(error);
-                UpdateKeyLabels();
+                error = Marshal.GetLastPInvokeError();
+                continue;
             }
 
+            // Рабочую клавишу снимаем только после успешной регистрации замены.
+            Native.UnregisterHotKey(Handle, _toggleHotkeyId);
+            _toggleHotkeyId = nextId;
+            _hotkeyIndex = next;
+            _registeredToggleIndex = next;
+            _hotkeyFailure = _otherHotkeyFailure;
+            _deliveryBlocked = null;
+            Program.SaveToggleIndex(next);
+            if (_engine is not null) _engine.ToggleKeyName = toggle.Label;
+            _noteText = $"старт/стоп — {ToggleKeyLabel}; занятые сочетания пропускаются.";
+            UpdateKeyLabels();
+            RefreshHelper();
             return;
         }
 
-        Native.UnregisterHotKey(Handle, _toggleHotkeyId);
-        _toggleHotkeyId = nextId;
-        _registeredToggleIndex = _hotkey.SelectedIndex;
-        _hotkeyFailure = _otherHotkeyFailure;
-        _deliveryBlocked = null;
-        Program.SaveToggleIndex(_registeredToggleIndex);
-
-        if (_engine is not null)
-        {
-            _engine.ToggleKeyName = toggle.Label;
-        }
-
-        ReportHotkeys(_hotkeyFailure);
-        UpdateKeyLabels();
+        if (_registeredToggleIndex >= 0)
+            _noteText = $"другие сочетания заняты ({error}); работает {ToggleKeyLabel}.";
+        else
+            _hotkeyFailure = error;
+        RefreshHelper();
     }
 
     protected override void OnHandleDestroyed(EventArgs e)
@@ -337,6 +394,27 @@ internal sealed class MainForm : Form
         Native.UnregisterHotKey(Handle, Program.HotQuit);
         _registeredToggleIndex = -1;
         base.OnHandleDestroyed(e);
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+        {
+            HideToTray();
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        // Системной рамки нет: бесрамочное окно таскаем за верхнюю полосу-заголовок.
+        if (e.Button == MouseButtons.Left && e.Y < S(48))
+        {
+            ReleaseCapture();
+            SendMessage(Handle, 0x00A1, (IntPtr)2, IntPtr.Zero);
+        }
     }
 
     protected override void WndProc(ref Message message)
@@ -356,15 +434,7 @@ internal sealed class MainForm : Form
                     Close();
                     break;
             }
-
             return;
-        }
-
-        if (Native.IsMouseButtonMessage((uint)message.Msg))
-        {
-            // Метку ставит сам клик кликера (Program.OwnClickTag в dwExtraInfo).
-            // Живое нажатие приходит без неё, поэтому «Стоп» по кнопке всегда настоящий.
-            _ownClickSeen = Native.GetMessageExtraInfo() == Program.OwnClickTag;
         }
 
         base.WndProc(ref message);
@@ -374,72 +444,118 @@ internal sealed class MainForm : Form
     {
         _refresh.Dispose();
         _capture.Dispose();
+        _fade.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         _trayMenu.Dispose();
         _iconOn.Dispose();
         _iconOff.Dispose();
+        _brandFont.Dispose();
+        _metaFont.Dispose();
         _engine = null;
         ShutdownEngine();
         base.OnFormClosed(e);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        using var brush = new SolidBrush(Theme.BgBottom);
+        e.Graphics.FillRectangle(brush, ClientRectangle);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+        using (var path = Theme.Round(new RectangleF(0.5f, 0.5f, ClientSize.Width - 1, ClientSize.Height - 1), S(24)))
+        using (var pen = new Pen(Theme.Hair(0.08f), 1))
+        {
+            g.DrawPath(pen, path);
+        }
+
+        Theme.DrawTracked(g, "autoclicker", _brandFont, Theme.Dim, new PointF(S(24), S(20)), 0.12f);
+
+        var running = _engine is not null;
+        var clicks = running ? _engine!.Clicks : _lastClicks;
+        var countLabel = _current.HoldMode ? "зажатий" : "кликов";
+        var meta = running ? $"включён · {countLabel} {clicks}" : "выключен";
+        using var brush = new SolidBrush(Theme.Dim);
+        using var format = new StringFormat
+        {
+            Trimming = StringTrimming.EllipsisCharacter,
+            FormatFlags = StringFormatFlags.NoWrap,
+        };
+        g.DrawString(meta, _metaFont, brush, new RectangleF(S(144), S(20), S(376), S(20)), format);
+        g.DrawString(_holdOn ? "пауза не нужна в режиме зажатия" : "мс между кликами", _metaFont, brush,
+            new RectangleF(S(128), S(61), S(450), S(20)), format);
+
+        using (var pen = new Pen(_interval.Focused ? Theme.Hair(0.45f) : Theme.Hair(0.12f), 1))
+            g.DrawLine(pen, S(24), S(92), S(696), S(92));
+
+        if (_fixedOn)
+        {
+            g.DrawString("x", _metaFont, brush, new PointF(S(410), S(180)));
+            g.DrawString("y", _metaFont, brush, new PointF(S(534), S(180)));
+        }
+        else
+        {
+            g.DrawString("прицел — запомнить точку", _metaFont, brush, new PointF(S(430), S(181)));
+        }
+
+        var limitHint = _holdOn ? "отпустится при остановке" : _limitOn ? "после" : "кликать до остановки";
+        g.DrawString(limitHint, _metaFont, brush, new PointF(S(208), S(220)));
+        if (_limitOn && !_holdOn)
+            g.DrawString("кликов", _metaFont, brush, new PointF(S(408), S(220)));
+
+        foreach (var input in new[] { _targetX, _targetY, _count })
+        {
+            if (!input.Visible) continue;
+            using var pen = new Pen(input.Focused ? Theme.Hair(0.45f) : Theme.Hair(0.12f), 1);
+            g.DrawLine(pen, input.Left, input.Bottom + S(3), input.Right, input.Bottom + S(3));
+        }
+        g.DrawString("Esc — спрятать", _metaFont, brush, new PointF(S(24), S(300)));
     }
 
     private static Icon MakeStateIcon(Color color)
     {
         using var bitmap = new Bitmap(16, 16);
         using var graphics = Graphics.FromImage(bitmap);
-        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
         using var brush = new SolidBrush(color);
         graphics.FillEllipse(brush, 1, 1, 13, 13);
-        return Icon.FromHandle(bitmap.GetHicon());
+        var handle = bitmap.GetHicon();
+        try
+        {
+            using var icon = Icon.FromHandle(handle);
+            return (Icon)icon.Clone();
+        }
+        finally { DestroyIcon(handle); }
     }
 
-    /// Останавливает и запускает без оговорок: хоткей исходит от живого нажатия,
-    /// и глушить его нельзя ни при каких интервалах.
+    /// Хоткей исходит от живого нажатия — глушить его нельзя ни при каких интервалах.
     private void ToggleRunning()
     {
-        if (_engine is null)
-        {
-            Start();
-        }
-        else
-        {
-            Stop();
-            // После автосворачивания окно обычно не видно: без всплывашки остановку
-            // выдаётся заметить только по потухшему значку в трее.
-            ShowBalloon("Выключен.");
-        }
-
+        if (_engine is null) Start();
+        else { Stop(); ShowBalloon("выключен."); }
         RefreshStatus();
-    }
-
-    /// Кликер бьёт туда, где курсор, а нажатие «Старт» оставляет курсор ровно на кнопке:
-    /// её же первый синтетический клик и приходился по «Стоп». Такой клик узнаётся по
-    /// метке в dwExtraInfo и игнорируется; живой клик по кнопке останавливает всегда.
-    private void OnToggleClick()
-    {
-        if (_engine is not null && _ownClickSeen)
-        {
-            _note.Text = "Кликер кликнул по своей кнопке — убери курсор с окна.";
-            RefreshStatus();
-            return;
-        }
-
-        ToggleRunning();
     }
 
     private void Start()
     {
         if (_capture.Enabled)
         {
-            _note.Text = "Сначала дождись захвата точки.";
-            ShowBalloon(_note.Text);
+            _noteText = "сначала дождись захвата точки.";
+            ShowBalloon(_noteText);
+            RefreshHelper();
             return;
         }
 
-        // Убираем окно с дороги до первого клика: иначе первый же синтетический клик
-        // приходится в собственные контролы. Возврат — клик по значку в трее или панель.
-        WindowState = FormWindowState.Minimized;
+        // Убираем окно с дороги до первого клика, иначе первый синтетический клик
+        // приходится в собственные контролы. Возврат — клик по значку в трее.
+        Hide();
 
         _current = BuildSettings();
         _lastClicks = 0;
@@ -450,10 +566,9 @@ internal sealed class MainForm : Form
             Report = ShowNote,
             LimitReached = msg => OnUi(() =>
             {
-                // Кнопка гаснет следом на ближайшем обновлении статуса — пишем причину крупно,
-                // чтобы это не выглядело самоотключением.
                 _lastClicks = _engine?.Clicks ?? _lastClicks;
-                _note.Text = msg;
+                _noteText = msg;
+                RefreshHelper();
                 ShowBalloon(msg);
             }),
         };
@@ -463,26 +578,22 @@ internal sealed class MainForm : Form
         _worker.Start();
 
         UpdateKeyLabels();
-        _note.Text = _current.Count > 0
-            ? $"Лимит: {_current.Count} — после него кликер сам погаснет, это не поломка."
-            : $"Клики идут без лимита — {ToggleKeyLabel} или кнопка остановят.";
+        _noteText = _current.HoldMode
+            ? $"кнопка будет зажата до остановки — {ToggleKeyLabel} или кнопка отпустят её."
+            : _current.Count > 0
+                ? $"лимит: {_current.Count} — после него кликер сам погаснет, это не поломка."
+                : $"клики идут без лимита — {ToggleKeyLabel} или кнопка остановят.";
+        if (!_current.HasTarget && !_current.HoldMode)
+            _noteText = $"клики идут за курсором · {ToggleKeyLabel} — остановить.";
 
-        if (!_current.HasTarget)
-        {
-            _note.Text = "Кликер бьёт туда, где курсор: держи его вне этого окна.";
-        }
-
-        ShowBalloon($"Включён и свёрнут. {ToggleKeyLabel} — стоп, клик по значку в трее — окно.");
+        RefreshHelper();
+        ShowBalloon($"включён и свёрнут. {ToggleKeyLabel} — стоп, клик по значку в трее — окно.");
     }
 
     private void ShowBalloon(string message)
     {
-        // Работничает, только когда окно свёрнуто: иначе сообщение видно в окне.
-        if (WindowState != FormWindowState.Minimized)
-        {
-            return;
-        }
-
+        // Всплывашка нужна, только когда окно скрыто в трее: иначе сообщение видно в карточке.
+        if (Visible) return;
         _tray.ShowBalloonTip(3000, "Автокликер", message, ToolTipIcon.Info);
     }
 
@@ -494,64 +605,116 @@ internal sealed class MainForm : Form
         UpdateKeyLabels();
     }
 
-    private string ToggleKeyLabel => Program.ToggleHotkeys[_hotkey.SelectedIndex].Label;
+    private string ToggleKeyLabel => Program.ToggleHotkeys[_hotkeyIndex].Label;
 
-    private string StartLabel(bool running) => (running ? "⏹ Стоп (" : "▶ Старт (") + ToggleKeyLabel + ")";
-
-    /// Кнопка и пункт меню в трее всегда показывают ту клавишу, которая сейчас зарегистрирована.
     private void UpdateKeyLabels()
     {
-        var label = StartLabel(_engine is not null);
-        _toggle.Text = label;
-        _trayToggle.Text = label;
+        var running = _engine is not null;
+        _startBtn.Text = running ? "стоп" : "старт";
+        _startBtn.Glyph = running ? GlyphKind.Stop : GlyphKind.Play;
+        _startBtn.Invalidate();
+        _keyPill.Text = SpacedKeyLabel;
+        _keyPill.Invalidate();
+        _trayToggle.Text = (running ? "стоп (" : "старт (") + ToggleKeyLabel + ")";
+        UpdateControls();
     }
 
-    private string HintsText() =>
-        $"{ToggleKeyLabel} — старт/стоп    Ctrl+Alt+F8 — координаты    Ctrl+Alt+F10 — выход";
+    private void UpdateControls()
+    {
+        var idle = _engine is null;
+        var interval = ParseInt(_interval, 10, 60_000, _current.IntervalMs);
+        _modeRow.Text = _holdOn ? "зажатие кнопки" : "автоматические клики";
+        _modeRow.Glyph = _holdOn ? GlyphKind.Hold : GlyphKind.Play;
+        _modeRow.SubText = _holdOn ? "держать кнопку до остановки" : $"один клик каждые {interval} мс";
+        _modeRow.RightText = idle ? "нажми, чтобы сменить режим" : $"{ToggleKeyLabel} — стоп";
 
-    /// Курсор в момент клика по кнопке стоит на самой кнопке, поэтому точку запоминаем не сразу,
-    /// а через паузу: за три секунды курсор успевает уйти в нужное место.
+        _buttonRow.Text = $"{ButtonLabels[_buttonIndex]} кнопка";
+        _pointRow.Text = _fixedOn ? "фиксированная точка" : "где курсор";
+        _limitRow.Text = _holdOn ? "без лимита" : _limitOn ? "лимит включён" : "без лимита";
+
+        _modeRow.Enabled = idle;
+        _buttonRow.Enabled = idle;
+        _pointRow.Enabled = idle;
+        _captureTile.Enabled = idle && !_capture.Enabled;
+        _interval.Enabled = idle && !_holdOn;
+        _limitRow.Enabled = idle && !_holdOn;
+        _count.Visible = _limitOn && !_holdOn;
+        _count.Enabled = idle && _limitOn && !_holdOn;
+        _targetX.Visible = _fixedOn;
+        _targetY.Visible = _fixedOn;
+        _targetX.Enabled = idle && _fixedOn;
+        _targetY.Enabled = idle && _fixedOn;
+
+        _modeRow.Invalidate();
+        _buttonRow.Invalidate();
+        _pointRow.Invalidate();
+        _limitRow.Invalidate();
+        Invalidate();
+    }
+
+    /// Нижняя строка всегда отвечает за главное: либо причину молчания клавиш/кликов, либо подсказку.
+    private void RefreshHelper()
+    {
+        if (_hotkeyFailure != 0)
+        {
+            _helper.ForeColor = Theme.Fg;
+            _helper.Text = $"горячие клавиши заняты: {Program.Win32Message(_hotkeyFailure)}";
+            return;
+        }
+
+        if (_deliveryBlocked == true)
+        {
+            _helper.ForeColor = Theme.Fg;
+            _helper.Text = "окно от администратора активно: клики не доходят";
+            return;
+        }
+
+        _helper.ForeColor = Theme.Dim;
+        _helper.Text = _noteText.Length > 0
+            ? _noteText
+            : "нажми на настройку, чтобы изменить · при старте окно спрячется в трей";
+    }
+
     private void BeginCapture()
     {
+        if (_engine is not null)
+        {
+            ShowNote("останови кликер перед сменой точки.");
+            return;
+        }
         _capture.Stop();
-        _note.Text = "Три секунды: поставь курсор в точку клика.";
-
-        // Из трея окно свёрнуто и _note невидим — поэтому то же самое уходит во всплывашку.
-        ShowBalloon("Три секунды: поставь курсор в точку клика.");
+        _noteText = "три секунды: поставь курсор в точку клика.";
+        RefreshHelper();
+        ShowBalloon(_noteText);
         _capture.Start();
+        UpdateControls();
     }
 
     private void RestoreFromTray()
     {
+        Show();
         WindowState = FormWindowState.Normal;
+        FadeIn();
         Activate();
     }
 
-    /// Поток кликов может в этот момент звать _shutdown.Cancel() на исчерпанном лимите,
-    /// а Cancel() на уже освобождённом источнике бросает ObjectDisposedException вне UI-потока.
-    /// Поэтому сначала ждём выхода потока, и только потом освобождаем источник.
+    /// Поток кликов может звать Cancel() на исчерпанном лимите, а Cancel() на уже
+    /// освобождённом источнике бросает ObjectDisposedException вне UI-потока. Поэтому
+    /// сначала ждём выхода потока, и только потом освобождаем источник.
     private void ShutdownEngine()
     {
         var cts = _cts;
         var worker = _worker;
         _cts = null;
         _worker = null;
-
-        if (cts is null)
-        {
-            return;
-        }
-
+        if (cts is null) return;
         cts.Cancel();
-        if (worker is null || worker.Join(250))
-        {
-            cts.Dispose();
-        }
+        if (worker is null || worker.Join(1000)) cts.Dispose();
     }
 
     private Settings BuildSettings()
     {
-        var (down, up, name) = _button.SelectedIndex switch
+        var (down, up, name) = _buttonIndex switch
         {
             1 => (Native.RightDown, Native.RightUp, "right"),
             2 => (Native.MiddleDown, Native.MiddleUp, "middle"),
@@ -560,101 +723,91 @@ internal sealed class MainForm : Form
 
         return new Settings
         {
-            IntervalMs = (int)_interval.Value,
+            IntervalMs = ParseInt(_interval, 10, 60_000, _current.IntervalMs),
             DownFlag = down,
             UpFlag = up,
             ButtonName = name,
-            Count = _limit.Checked ? (int)_count.Value : 0,
-            HasTarget = _fixedPoint.Checked,
-            X = (int)_targetX.Value,
-            Y = (int)_targetY.Value,
+            HoldMode = _holdOn,
+            Count = _holdOn ? 0 : _limitOn ? ParseInt(_count, 1, 1_000_000, Math.Max(1, _current.Count)) : 0,
+            HasTarget = _fixedOn,
+            X = ParseInt(_targetX, -32_768, 32_768, _current.X),
+            Y = ParseInt(_targetY, -32_768, 32_768, _current.Y),
         };
+    }
+
+    private void NormalizeInputs()
+    {
+        _interval.Text = ParseInt(_interval, 10, 60_000, _current.IntervalMs).ToString();
+        _targetX.Text = ParseInt(_targetX, -32_768, 32_768, _current.X).ToString();
+        _targetY.Text = ParseInt(_targetY, -32_768, 32_768, _current.Y).ToString();
+        _count.Text = ParseInt(_count, 1, 1_000_000, Math.Max(1, _current.Count)).ToString();
+        UpdateControls();
     }
 
     private void CaptureCursorPoint()
     {
         _capture.Stop();
-        if (!Native.GetCursorPos(out var point))
+        UpdateControls();
+        if (_engine is not null)
         {
-            _note.Text = "Не удалось прочитать позицию курсора.";
+            ShowNote("останови кликер перед сменой точки.");
             return;
         }
-
-        _targetX.Value = Clamp(point.X, _targetX);
-        _targetY.Value = Clamp(point.Y, _targetY);
-        _fixedPoint.Checked = true;
-        _note.Text = $"Запомлена точка {point.X},{point.Y}.";
-    }
-
-    private void UpdateTargetEnabled()
-    {
-        _targetX.Enabled = _fixedPoint.Checked;
-        _targetY.Enabled = _fixedPoint.Checked;
+        if (!Native.GetCursorPos(out var point))
+        {
+            _noteText = "не удалось прочитать позицию курсора.";
+            RefreshHelper();
+            return;
+        }
+        _targetX.Text = point.X.ToString();
+        _targetY.Text = point.Y.ToString();
+        _fixedOn = true;
+        UpdateControls();
+        _noteText = $"запомнена точка {point.X},{point.Y}.";
+        RefreshHelper();
     }
 
     private void RefreshStatus()
     {
-        // Движок сам завершается, когда выбран лимит кликов: приводим кнопку в согласие.
-        if (_engine is not null && _cts is not null && _cts.IsCancellationRequested)
-        {
-            Stop();
-        }
+        // Движок сам завершается на лимите кликов: приводим интерфейс в согласие.
+        if (_engine is not null && _cts is not null && _cts.IsCancellationRequested) Stop();
 
         var running = _engine is not null;
-        var where = _current.HasTarget ? $"точка {_current.X},{_current.Y}" : "где курсор";
-        var limit = _current.Count > 0 ? $"лимит {_current.Count}" : "без лимита";
-        var clicks = running ? _engine!.Clicks : _lastClicks;
-
-        _lamp.BackColor = running ? Color.FromArgb(0, 175, 90) : Color.FromArgb(190, 190, 190);
-        _stateLabel.Text = running ? "ВКЛЮЧЕН — кликает" : "ВЫКЛЮЧЕН";
-        Text = running ? "▶ Автокликер — включён" : "⏸ Автокликер — выключен";
+        Text = running ? "Автокликер — включён" : "Автокликер — выключен";
         _tray.Icon = running ? _iconOn : _iconOff;
-        _tray.Text = $"Автокликер: {(running ? "включён" : "выключен")} · кликов {clicks}";
-
-        _status.Text = $"интервал {_current.IntervalMs} мс · {where} · {limit} · кликов за запуск: {clicks}";
-
+        _tray.Text = $"Автокликер: {(running ? "включён" : "выключен")} · {(_current.HoldMode ? "зажатий" : "кликов")} {(running ? _engine!.Clicks : _lastClicks)}";
+        Invalidate();
         UpdateTrustWarning();
     }
 
-    /// Клики через SendInput не доходят до активного окна с правами выше (UIPI) — об этом окно
-    /// пишет в строку подсказок, пока фокус не вернётся к обычному окну. Кликер от
+    /// Клики через SendInput не доходят до активного окна с правами выше (UIPI). Кликер от
     /// администратора такие окна видит на равных, поэтому там предупреждение было бы ложным.
     private void UpdateTrustWarning()
     {
-        if (_hotkeyFailure != 0 || _selfElevated)
-        {
-            return;
-        }
+        if (_hotkeyFailure != 0 || _selfElevated) return;
 
         var window = Native.GetForegroundWindow();
         Native.GetWindowThreadProcessId(window, out var pid);
+        if (pid == 0) return;
 
-        if (pid == 0)
-        {
-            return;
-        }
-
-        // Права процесса фиксированы при создании, так что токен смотрим один раз на pid,
-        // а не каждые 100 мс.
+        // Права процесса фиксированы при создании: токен смотрим один раз на pid.
         if (pid != _foregroundPid)
         {
             _foregroundPid = pid;
             _foregroundElevated = Native.IsForegroundWindowElevated(window);
         }
 
-        if (_foregroundElevated == _deliveryBlocked)
-        {
-            return;
-        }
+        if (_foregroundElevated == _deliveryBlocked) return;
 
         _deliveryBlocked = _foregroundElevated;
-        _hints.ForeColor = _foregroundElevated ? Color.Firebrick : SystemColors.ControlText;
-        _hints.Text = _foregroundElevated
-            ? "Окно от администратора активно: клики не доходят"
-            : HintsText();
+        RefreshHelper();
     }
 
-    private void ShowNote(string message) => OnUi(() => _note.Text = message);
+    private void ShowNote(string message) => OnUi(() =>
+    {
+        _noteText = message;
+        RefreshHelper();
+    });
 
     /// Всё, что рабочий поток хочет показать, проходит отсюда: напрямую трогать
     /// контролы из `clicks` нельзя, а окно к этому моменту может уже закрываться.
@@ -662,10 +815,7 @@ internal sealed class MainForm : Form
     {
         try
         {
-            if (IsHandleCreated && !IsDisposed)
-            {
-                BeginInvoke(action);
-            }
+            if (IsHandleCreated && !IsDisposed) BeginInvoke(action);
         }
         catch (Exception e) when (e is InvalidOperationException or ObjectDisposedException)
         {
@@ -673,14 +823,25 @@ internal sealed class MainForm : Form
         }
     }
 
-    private static decimal Clamp(int value, NumericUpDown box) =>
-        Math.Max(box.Minimum, Math.Min(box.Maximum, value));
+    private static int ParseInt(TextBox box, int min, int max, int fallback) =>
+        int.TryParse(box.Text.Trim(), out var value) ? Math.Clamp(value, min, max) : fallback;
 
-    private static NumericUpDown NewNumber(int minimum, int maximum, int value) => new()
+    private static bool AnimationsEnabled()
     {
-        Minimum = minimum,
-        Maximum = maximum,
-        Value = Math.Max(minimum, Math.Min(maximum, value)),
-        Size = new Size(110, 28),
-    };
+        var enabled = true;
+        SystemParametersInfo(0x1042, 0, ref enabled, 0);
+        return enabled;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SystemParametersInfo(uint action, uint param, ref bool value, uint winIni);
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr icon);
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 }

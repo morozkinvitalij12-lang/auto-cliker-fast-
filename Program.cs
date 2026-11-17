@@ -227,7 +227,11 @@ internal static class Program
         Native.UnregisterHotKey(IntPtr.Zero, HotCoords);
         Native.UnregisterHotKey(IntPtr.Zero, HotQuit);
 
-        Console.WriteLine($"\nОстановлено. Кликов сделано: {engine.Clicks}.");
+        // Процесс не имеет права умереть раньше, чем поток отпустит зажатую кнопку:
+        // состояние мыши глобальное и переживает выход процесса.
+        worker.Join(1000);
+
+        Console.WriteLine($"\nОстановлено. {(settings.HoldMode ? "Зажатий" : "Кликов сделано")}: {engine.Clicks}.");
         return 0;
     }
 
@@ -238,7 +242,7 @@ internal static class Program
             case HotToggle:
                 engine.Toggle();
                 Console.WriteLine(engine.Running
-                    ? $"▶ клик каждые {settings.IntervalMs} мс"
+                    ? (settings.HoldMode ? "▶ кнопка зажата" : $"▶ клик каждые {settings.IntervalMs} мс")
                     : $"⏸ пауза (сделано {engine.Clicks})");
                 break;
 
@@ -291,6 +295,12 @@ internal static class Program
                 continue;
             }
 
+            if (name.Equals("hold", StringComparison.Ordinal))
+            {
+                result["hold"] = string.Empty;
+                continue;
+            }
+
             if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
             {
                 throw new ArgumentException($"Аргументу --{name} не хватает значения");
@@ -309,7 +319,7 @@ internal static class Program
 
             Использование:
               autoclicker [--interval 500] [--button left|right|middle] [--count 0]
-                          [--x <пикс>] [--y <пикс>]
+                          [--x <пикс>] [--y <пикс>] [--hold]
 
             Параметры:
               --interval <мс>  пауза между кликами, по умолчанию 500, минимум 10
@@ -318,6 +328,8 @@ internal static class Program
                                С --count старт сразу, без него — по клавише старт/стоп, процесс ждёт хоткеи.
               --x/--y <пикс>   фиксированная точка: курсор устанавливается туда перед каждым
                                кликом. Без --x/--y клик идёт туда, где сейчас курсор.
+              --hold           режим зажатия: кнопка нажимается один раз и держится до остановки.
+                               Интервал не используется, --count с ним не сочетается.
 
             Горячие клавиши (работают и при свёрнутом окне кликера):
               {{ToggleHotkeys[SavedToggleIndex].Label,-17}}включить / выключить клики
@@ -331,6 +343,7 @@ internal static class Program
             Примеры:
               autoclicker --interval 250
               autoclicker --button right --count 10 --x 820 --y 540
+              autoclicker --hold --button left
             """);
     }
 
@@ -366,6 +379,7 @@ internal static class Program
         public required uint UpFlag { get; init; }
         public required string ButtonName { get; init; }
         public required int Count { get; init; }
+        public required bool HoldMode { get; init; }
         public required bool HasTarget { get; init; }
         public required int X { get; init; }
         public required int Y { get; init; }
@@ -392,6 +406,22 @@ internal static class Program
                 throw new ArgumentException("--count не может быть отрицательным");
             }
 
+            var hold = false;
+            if (options.TryGetValue("hold", out var holdRaw))
+            {
+                hold = holdRaw.ToLowerInvariant() switch
+                {
+                    "" or "true" or "1" => true,
+                    "false" or "0" => false,
+                    _ => throw new ArgumentException($"--hold ожидал true/false, получено: {holdRaw}"),
+                };
+            }
+
+            if (hold && count > 0)
+            {
+                throw new ArgumentException("--count не сочетается с --hold: зажатие не считает клики");
+            }
+
             var x = GetInt(options, "x", 0);
             var y = GetInt(options, "y", 0);
             var hasTarget = options.ContainsKey("x") || options.ContainsKey("y");
@@ -403,6 +433,7 @@ internal static class Program
                 UpFlag = up,
                 ButtonName = label,
                 Count = count,
+                HoldMode = hold,
                 HasTarget = hasTarget,
                 X = x,
                 Y = y,
@@ -412,6 +443,11 @@ internal static class Program
         public string Describe()
         {
             var target = HasTarget ? $"в точку {X},{Y}" : "там, где курсор";
+            if (HoldMode)
+            {
+                return $"Кнопка: {ButtonName}, режим: зажатие до остановки, {target}.";
+            }
+
             var limit = Count > 0 ? Plural(Count, "клик", "клика", "кликов") : "без лимита";
             return $"Кнопка: {ButtonName}, интервал: {IntervalMs} мс, {limit}, клик {target}.";
         }
@@ -422,7 +458,10 @@ internal static class Program
         private readonly Settings _settings;
         private readonly CancellationTokenSource _shutdown;
         private readonly Input[] _click = new Input[2];
+        private readonly Input[] _holdDown = new Input[1];
+        private readonly Input[] _holdUp = new Input[1];
         private bool _blockedReported;
+        private bool _held;
 
         public Engine(Settings settings, CancellationTokenSource shutdown)
         {
@@ -431,6 +470,8 @@ internal static class Program
 
             _click[0] = ClickInput(settings.DownFlag);
             _click[1] = ClickInput(settings.UpFlag);
+            _holdDown[0] = _click[0];
+            _holdUp[0] = _click[1];
         }
 
         private long _clicks;
@@ -460,39 +501,104 @@ internal static class Program
 
         public void Run()
         {
+            try
+            {
+                if (_settings.HoldMode)
+                {
+                    RunHold();
+                    return;
+                }
+
+                while (!_shutdown.IsCancellationRequested)
+                {
+                    if (!Running)
+                    {
+                        Thread.Sleep(25);
+                        continue;
+                    }
+
+                    if (_settings.HasTarget)
+                    {
+                        Native.SetCursorPos(_settings.X, _settings.Y);
+                    }
+
+                    var sent = Native.SendInput((uint)_click.Length, _click, Marshal.SizeOf<Input>());
+                    if (sent != (uint)_click.Length && !_blockedReported)
+                    {
+                        _blockedReported = true;
+                        Notify("Windows отклонил SendInput — обычно это значит, что активное окно запущено с правами выше (admin) или защищено античитом.");
+                    }
+
+                    var clicks = Interlocked.Increment(ref _clicks);
+
+                    if (_settings.Count > 0 && clicks >= _settings.Count)
+                    {
+                        Running = false;
+                        _shutdown.Cancel();
+                        (LimitReached ?? Notify)(
+                            $"Лимит исчерпан: {Plural(_settings.Count, "клик", "клика", "кликов")}."
+                            + $" Нажми {ToggleKeyName} или Старт — снова включится.");
+                        continue;
+                    }
+
+                    SleepBetweenClicks(_settings.IntervalMs);
+                }
+            }
+            finally
+            {
+                // Зажатая кнопка обязана отпуститься при любом выходе: стоп, лимит, выход, ошибка.
+                ReleaseHold();
+            }
+        }
+
+        private void RunHold()
+        {
             while (!_shutdown.IsCancellationRequested)
             {
-                if (!Running)
+                if (Running && !_held)
                 {
-                    Thread.Sleep(25);
-                    continue;
+                    if (_settings.HasTarget)
+                    {
+                        Native.SetCursorPos(_settings.X, _settings.Y);
+                    }
+
+                    var sent = Native.SendInput(1, _holdDown, Marshal.SizeOf<Input>());
+                    if (sent != 1 && !_blockedReported)
+                    {
+                        _blockedReported = true;
+                        Notify("Windows отклонил SendInput — обычно это значит, что активное окно запущено с правами выше (admin) или защищено античитом.");
+                    }
+
+                    _held = true;
+                    Interlocked.Increment(ref _clicks);
+                }
+                else if (!Running && _held)
+                {
+                    ReleaseHold();
                 }
 
-                if (_settings.HasTarget)
+                Thread.Sleep(20);
+            }
+        }
+
+        private void ReleaseHold()
+        {
+            if (!_held)
+            {
+                return;
+            }
+
+            _held = false;
+            var sent = Native.SendInput(1, _holdUp, Marshal.SizeOf<Input>());
+            if (sent != 1)
+            {
+                // За время зажатия активное окно могло стать админским (UIPI): пробуем ещё раз
+                // и честно сообщаем, если кнопка так и не отпущена.
+                sent = Native.SendInput(1, _holdUp, Marshal.SizeOf<Input>());
+                if (sent != 1)
                 {
-                    Native.SetCursorPos(_settings.X, _settings.Y);
+                    Notify("Не удалось отпустить зажатую кнопку — щёлкни живой мышью, чтобы сбросить её.");
                 }
-
-                var sent = Native.SendInput((uint)_click.Length, _click, Marshal.SizeOf<Input>());
-                if (sent != (uint)_click.Length && !_blockedReported)
-                {
-                    _blockedReported = true;
-                    Notify("Windows отклонил SendInput — обычно это значит, что активное окно запущено с правами выше (admin) или защищено античитом.");
-                }
-
-                var clicks = Interlocked.Increment(ref _clicks);
-
-                if (_settings.Count > 0 && clicks >= _settings.Count)
-                {
-                    Running = false;
-                    _shutdown.Cancel();
-                    (LimitReached ?? Notify)(
-                        $"Лимит исчерпан: {Plural(_settings.Count, "клик", "клика", "кликов")}."
-                        + $" Нажми {ToggleKeyName} или Старт — снова включится.");
-                    continue;
-                }
-
-                SleepBetweenClicks(_settings.IntervalMs);
             }
         }
 
@@ -528,13 +634,14 @@ internal static class Program
         public const uint WmQuit = 0x0012;
         public const uint WmHotkey = 0x0312;
 
-        private const uint WmLButtonDown = 0x0201, WmLButtonUp = 0x0202;
-        private const uint WmRButtonDown = 0x0204, WmRButtonUp = 0x0205;
-        private const uint WmMButtonDown = 0x0207, WmMButtonUp = 0x0208;
+        private const uint WmLButtonDown = 0x0201, WmLButtonUp = 0x0202, WmLButtonDoubleClick = 0x0203;
+        private const uint WmRButtonDown = 0x0204, WmRButtonUp = 0x0205, WmRButtonDoubleClick = 0x0206;
+        private const uint WmMButtonDown = 0x0207, WmMButtonUp = 0x0208, WmMButtonDoubleClick = 0x0209;
 
-        /// Сообщения от любой кнопки мыши — именно на них смотрим метку собственного клика.
         public static bool IsMouseButtonMessage(uint message) =>
-            message is WmLButtonDown or WmLButtonUp or WmRButtonDown or WmRButtonUp or WmMButtonDown or WmMButtonUp;
+            message is WmLButtonDown or WmLButtonUp or WmLButtonDoubleClick
+                or WmRButtonDown or WmRButtonUp or WmRButtonDoubleClick
+                or WmMButtonDown or WmMButtonUp or WmMButtonDoubleClick;
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetMessageExtraInfo();
